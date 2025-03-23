@@ -1,0 +1,7 @@
+streamlit
+pytube
+whisper
+git+https://github.com/openai/whisper.git
+anthropic
+langdetect
+python-dotenv
