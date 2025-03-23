@@ -6,4 +6,3 @@ anthropic
 langdetect
 python-dotenv
 pytube
-ffmpeg
