@@ -98,7 +98,67 @@ def download_video_direct(url):
     except Exception as e:
         st.error(f"Error with direct download: {str(e)}")
         return None
+# Add this function before transcribe_video
+def verify_audio_exists(video_path):
+    try:
+        import subprocess
+        # Check if the file contains an audio stream
+        result = subprocess.run(
+            ['ffmpeg', '-i', video_path, '-af', 'volumedetect', '-f', 'null', '-'],
+            stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True
+        )
+        # Check if audio stream is found in the output
+        return "Stream #0:1" in result.stderr or "Audio" in result.stderr
+    except Exception as e:
+        st.error(f"Error verifying audio: {str(e)}")
+        return False
 
+# Then modify your transcribe_video function:
+def transcribe_video(video_path):
+    st.info("Transcribing video (this may take a few minutes)...")
+    progress_bar = st.progress(0)
+    
+    try:
+        # First verify the file has audio
+        if not verify_audio_exists(video_path):
+            st.error("No audio stream found in the video file. Cannot transcribe.")
+            return None
+            
+        # Get the Whisper model
+        model = load_whisper_model()
+        
+        # Extract audio to a temporary WAV file first
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_audio:
+            audio_path = temp_audio.name
+        
+        # Use ffmpeg to extract audio
+        import subprocess
+        subprocess.run([
+            'ffmpeg', '-i', video_path, 
+            '-q:a', '0', '-map', 'a', 
+            '-f', 'wav', audio_path
+        ], check=True)
+        
+        # Verify the audio file has data
+        if os.path.getsize(audio_path) < 1000:  # If file is too small
+            st.error("Extracted audio file is too small or empty.")
+            return None
+        
+        # Start transcription on the extracted audio
+        progress_bar.progress(0.5)
+        result = model.transcribe(audio_path)
+        progress_bar.progress(1.0)
+        
+        # Clean up temp file
+        os.unlink(audio_path)
+        
+        return result["text"]
+    except Exception as e:
+        st.error(f"Error transcribing video: {str(e)}")
+        return None
+        
 # Function to transcribe video
 def transcribe_video(video_path):
     st.info("Transcribing video (this may take a few minutes)...")
