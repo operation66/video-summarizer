@@ -7,11 +7,9 @@ import anthropic
 from pytube import YouTube
 import whisper
 from langdetect import detect
-from dotenv import load_dotenv
 import time
-
-# Load environment variables from .env file if present
-load_dotenv()
+import re
+import yt_dlp
 
 # Page configuration
 st.set_page_config(
@@ -39,42 +37,66 @@ def load_whisper_model():
     with st.spinner("Loading Whisper model (first run only)..."):
         return whisper.load_model("base")
 
-# Function to download video (now supports YouTube)
-def download_video(url):
+# Function to download video using yt-dlp (more robust method)
+def download_video_ytdlp(url):
     st.info("Downloading video...")
     progress_bar = st.progress(0)
     
     try:
-        if "youtube.com" in url or "youtu.be" in url:
-            # Download from YouTube
-            yt = YouTube(url)
-            video_stream = yt.streams.filter(progressive=True, file_extension='mp4').first()
-            
+        # Create a temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as temp_file:
+            temp_filename = temp_file.name
+        
+        # Configure yt-dlp options
+        ydl_opts = {
+            'format': 'best[ext=mp4]',
+            'outtmpl': temp_filename,
+            'progress_hooks': [lambda d: progress_bar.progress(d['downloaded_bytes'] / d['total_bytes'] if 'total_bytes' in d and d['total_bytes'] > 0 else 0)],
+            'quiet': True,
+            'no_warnings': True
+        }
+        
+        # Try to download the video
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        
+        progress_bar.progress(1.0)
+        return temp_filename
+    except Exception as e:
+        st.error(f"Error downloading video with yt-dlp: {str(e)}")
+        return None
+
+# Fallback function to download video using direct requests
+def download_video_direct(url):
+    st.info("Attempting direct download...")
+    progress_bar = st.progress(0)
+    
+    try:
+        # Add a user agent to help with some sites
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        }
+        
+        response = requests.get(url, stream=True, headers=headers)
+        if response.status_code == 200:
             # Create a temporary file to store the video
             with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as temp_file:
-                video_stream.download(output_path=os.path.dirname(temp_file.name), 
-                                     filename=os.path.basename(temp_file.name))
-                progress_bar.progress(100)
+                total_size = int(response.headers.get('content-length', 0))
+                downloaded = 0
+                
+                for chunk in response.iter_content(chunk_size=1024*1024):  # 1MB chunks
+                    temp_file.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        progress_bar.progress(min(downloaded / total_size, 1.0))
+                
+                progress_bar.progress(1.0)
                 return temp_file.name
         else:
-            # Download from direct URL (Bunny.net or other)
-            response = requests.get(url, stream=True)
-            if response.status_code == 200:
-                # Create a temporary file to store the video
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as temp_file:
-                    total_size = int(response.headers.get('content-length', 0))
-                    downloaded = 0
-                    
-                    for chunk in response.iter_content(chunk_size=1024*1024):  # 1MB chunks
-                        temp_file.write(chunk)
-                        downloaded += len(chunk)
-                        if total_size > 0:
-                            progress_bar.progress(min(downloaded / total_size, 1.0))
-                    
-                    progress_bar.progress(1.0)
-                    return temp_file.name
+            st.error(f"Failed to download: HTTP status code {response.status_code}")
+            return None
     except Exception as e:
-        st.error(f"Error downloading video: {str(e)}")
+        st.error(f"Error with direct download: {str(e)}")
         return None
 
 # Function to transcribe video
@@ -87,7 +109,7 @@ def transcribe_video(video_path):
         model = load_whisper_model()
         
         # Start transcription
-        result = model.transcribe(video_path, progress_callback=lambda progress: progress_bar.progress(progress))
+        result = model.transcribe(video_path)
         progress_bar.progress(1.0)
         return result["text"]
     except Exception as e:
@@ -127,7 +149,7 @@ def generate_structured_summary(transcript, lang):
     
     try:
         response = client.messages.create(
-            model="claude-3-sonnet-20240229",  # You can change to claude-3-7-sonnet-20250219 if available
+            model="claude-3-sonnet-20240229",  # Using a model that should be available
             max_tokens=4000,
             temperature=0.3,
             messages=[
@@ -153,18 +175,36 @@ def format_for_animation(structured_content):
 
 # Main app UI
 with st.form("video_form"):
-    video_url = st.text_input("Video URL (YouTube or direct link):", 
+    video_url = st.text_input("Video URL (YouTube, Bunny.net, or direct link):", 
                              placeholder="https://www.youtube.com/watch?v=example")
+    
+    # Optional file upload for local videos
+    uploaded_file = st.file_uploader("Or upload a video file:", type=["mp4", "mov", "avi", "mkv"])
     
     submit_button = st.form_submit_button("Process Video")
 
 # Process the video when the form is submitted
-if submit_button and video_url:
+if submit_button and (video_url or uploaded_file):
     # Create a container for results
     result_container = st.container()
+    video_path = None
     
-    # Step 1: Download the video
-    video_path = download_video(video_url)
+    # Handle file upload if provided
+    if uploaded_file is not None:
+        with st.spinner("Saving uploaded video..."):
+            # Save the uploaded video to a temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as temp_file:
+                temp_file.write(uploaded_file.getbuffer())
+                video_path = temp_file.name
+    # Handle URL if provided
+    elif video_url:
+        # First try with yt-dlp (most robust method)
+        video_path = download_video_ytdlp(video_url)
+        
+        # If that fails, try direct download as fallback
+        if not video_path:
+            st.warning("Primary download method failed. Trying alternative method...")
+            video_path = download_video_direct(video_url)
     
     if video_path:
         # Step 2: Transcribe the video
@@ -224,3 +264,20 @@ if submit_button and video_url:
                     os.unlink(video_path)
                 except:
                     pass
+    else:
+        st.error("Unable to process the video. Please check the URL or try uploading the file directly.")
+
+# Add instructions at the bottom
+with st.expander("Need help?"):
+    st.markdown("""
+    ### Troubleshooting
+    
+    If you're experiencing download issues:
+    
+    1. **Try YouTube links** - These typically work more reliably
+    2. **Upload the video directly** - If downloading fails, you can upload the file
+    3. **Check URL format** - Make sure the URL is complete and accessible
+    4. **Special Characters** - Some URLs with special characters may cause issues
+    
+    For Bunny.net URLs, make sure they're publicly accessible.
+    """)
